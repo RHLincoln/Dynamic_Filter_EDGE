@@ -110,9 +110,13 @@ The local keyboard shortcut is implemented inside the content script.
 ## File Structure
 
 DynamicSearchLiteSafe/
+
 ├─ manifest.json
+
 ├─ background.js
+
 ├─ content.js
+
 └─ styles.css
 
 ### Component Roles
