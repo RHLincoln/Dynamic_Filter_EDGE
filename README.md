@@ -2,7 +2,7 @@
 
 A lightweight Microsoft Edge extension that adds a popup **dynamic search** box to every page. It highlights matches and **auto‑updates** as content changes (scrolling, dropdowns, SPA navigation, lazy loading). Designed specifically for **managed enterprise devices**, with **minimal permissions**, **zero network calls**, and **low resource usage**.
 
-> **Build type:** Option B (Minimal permissions, popup-based dynamic search)  
+> **Build type:** Minimal permissions, popup-based dynamic search
 > This version is optimized for performance and safety in organizational environments.
 
 ---
@@ -152,7 +152,7 @@ Future enhancements (optional):
 
 ## License
 
-This project is licensed under the **MIT License**.
+None
 
 ---
 
