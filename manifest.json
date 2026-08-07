@@ -1,0 +1,21 @@
+{
+  "name": "Dynamic Search (Auto-Update, Safe)",
+  "version": "1.0.0",
+  "manifest_version": 3,
+  "description": "Lightweight popup search that auto-updates highlights as the page changes. No special permissions.",
+  "action": {
+    "default_title": "Dynamic Search"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}
