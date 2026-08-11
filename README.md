@@ -156,7 +156,7 @@ Future enhancements (optional):
 
 ## License
 
-MTI
+MIT
 
 ---
 
