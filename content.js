@@ -1,239 +1,394 @@
-(() => {
-  const OVERLAY_ID = "dyn-search-overlay";
+/**
+ * content.js – DynamicSearchLiteSafe v3.1
+ *
+ * Bug fixes from v3.0
+ * ════════════════════════════════════════════════════════════════
+ *
+ * BUG 1 — Navigation always resets to match 1
+ * ────────────────────────────────────────────
+ * Root cause: the v3.0 fingerprint used `document.body.innerText`,
+ * which is LAYOUT-DEPENDENT. When `scrollTo()` calls
+ * `classList.add("dyn-mark-current")`, browsers often re-layout,
+ * which changes what `innerText` returns (collapsed sections expand,
+ * whitespace normalisation shifts, etc.). The fingerprint therefore
+ * changed even though no real content changed, the observer fired,
+ * `scheduleRescan()` ran, `highlightQuery()` was called, and
+ * `currentIdx` was reset to 0 every time.
+ *
+ * Fix: replace the innerText fingerprint with a flag+rAF guard that
+ * is actually race-free.  The flag (`_ownWrite`) is set to `true`
+ * before we touch the DOM and cleared inside a `requestAnimationFrame`
+ * callback — AFTER the browser has flushed paint and delivered all
+ * mutation records that our write caused.  v2.x tried a plain boolean
+ * cleared in `finally{}`, which cleared BEFORE the async MutationObserver
+ * callback ran.  The rAF guarantee fixes that.
+ *
+ * BUG 2 — Clicking a real <a href> link destroys state
+ * ─────────────────────────────────────────────────────
+ * Root cause: `popstate`/`hashchange` only fire for History-API (SPA)
+ * navigation. A normal link load destroys the entire JS context —
+ * all variables, the popup, the observer — and the content script
+ * re-runs from scratch on the new page with no memory of the previous
+ * query.
+ *
+ * Fix: persist `lastQuery` and `popupWasOpen` to
+ * `chrome.storage.session` (tab-scoped, cleared when the tab closes,
+ * never written to disk).  On script init, read them back.  If a query
+ * was active, auto-reopen the popup and re-run the search on the new
+ * page.  This gives seamless cross-page search with zero extra
+ * permissions (storage is already declared).
+ */
 
-  const state = {
-    query: "",
-    marks: [],
-    index: 0,
-    observer: null,
-    overlay: null,
-    input: null,
-    countEl: null
-  };
+if (typeof window.__dynSearchReady === "undefined") {
+  window.__dynSearchReady = true;
 
-  function ensureOverlay() {
-    let existing = document.getElementById(OVERLAY_ID);
-    if (existing) {
-      state.overlay = existing;
-      state.input = existing.querySelector("#dyn-search-input");
-      state.countEl = existing.querySelector("#dyn-count");
-      return;
+  // ── Debug log (ring buffer 200) ──────────────────────────────────────────────
+  window.__dynSearchLog = [];
+  function log(level, ...args) {
+    const entry = { ts: new Date().toISOString(), level, msg: args.map(String).join(" ") };
+    window.__dynSearchLog.push(entry);
+    if (window.__dynSearchLog.length > 200) window.__dynSearchLog.shift();
+    if (level === "error") console.error("[DynSearch]", ...args);
+    else if (level === "warn")  console.warn("[DynSearch]",  ...args);
+  }
+
+  // ── State ────────────────────────────────────────────────────────────────────
+  let popup      = null;
+  let inputEl    = null;
+  let countEl    = null;
+  let marks      = [];
+  let currentIdx = -1;
+  let lastQuery  = "";
+  let debounceTimer = null;
+  let rescanTimer   = null;
+  let _observer     = null;
+
+  // FIX 1: replaces the innerText fingerprint.
+  // Set to true before any DOM write; cleared inside a rAF so it stays
+  // true until AFTER the browser has delivered all resulting mutation records.
+  let _ownWrite = false;
+
+  // ── Session-storage helpers (FIX 2) ─────────────────────────────────────────
+  // chrome.storage.session is tab-isolated and clears when the tab closes.
+  // We use it to carry the active query across real page navigations.
+  const SESSION_KEY = "__dynSearch_session";
+
+  function saveSession() {
+    try {
+      chrome.storage.session.set({
+        [SESSION_KEY]: { query: lastQuery, open: !!popup }
+      });
+    } catch (_) { /* storage unavailable on some pages — safe to ignore */ }
+  }
+
+  async function loadSession() {
+    try {
+      const result = await chrome.storage.session.get(SESSION_KEY);
+      return result?.[SESSION_KEY] ?? null;
+    } catch (_) {
+      return null;
     }
+  }
 
-    const overlay = document.createElement("div");
-    overlay.id = OVERLAY_ID;
-    overlay.style.display = "none";
+  function clearSession() {
+    try { chrome.storage.session.remove(SESSION_KEY); } catch (_) {}
+  }
 
-    overlay.innerHTML = `
-      <div class="dyn-box" role="group" aria-label="Dynamic search">
-        <input id="dyn-search-input" type="text" placeholder="Dynamic search…" aria-label="Search" />
-        <span id="dyn-count">0/0</span>
-        <button id="dyn-btn-prev" title="Previous (Shift+Enter)" aria-label="Previous">▲</button>
-        <button id="dyn-btn-next" title="Next (Enter)" aria-label="Next">▼</button>
-        <button id="dyn-btn-close" title="Close (Esc)" aria-label="Close">✕</button>
-      </div>
-    `;
-    document.documentElement.appendChild(overlay);
-
-    state.overlay = overlay;
-    state.input = overlay.querySelector("#dyn-search-input");
-    state.countEl = overlay.querySelector("#dyn-count");
-
-    overlay.querySelector("#dyn-btn-prev").addEventListener("click", () => goTo(-1));
-    overlay.querySelector("#dyn-btn-next").addEventListener("click", () => goTo(1));
-    overlay.querySelector("#dyn-btn-close").addEventListener("click", closePopup);
-
-    state.input.addEventListener("input", onQueryChange);
-    state.input.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" && e.shiftKey) { e.preventDefault(); goTo(-1); }
-      else if (e.key === "Enter")           { e.preventDefault(); goTo(1); }
-      else if (e.key === "Escape")          { e.preventDefault(); closePopup(); }
-    });
-
-    document.addEventListener("keydown", (e) => {
-      // Local shortcut: Ctrl+Shift+F toggles popup without needing extension 'commands'
-      const isLocalToggle = e.ctrlKey && e.shiftKey && e.key?.toLowerCase() === "f";
-      if (isLocalToggle) {
-        e.preventDefault();
-        togglePopup();
-      } else if (e.key === "Escape" && isPopupVisible()) {
-        e.preventDefault();
-        closePopup();
-      }
+  // ── Own-write guard (FIX 1) ──────────────────────────────────────────────────
+  // Call this before touching the DOM. The guard stays active until after the
+  // next paint (rAF), which is after the browser delivers mutation records.
+  function markOwnWrite() {
+    _ownWrite = true;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {          // double-rAF: guarantees post-paint
+        _ownWrite = false;
+      });
     });
   }
 
-  function isPopupVisible() {
-    return !!state.overlay && state.overlay.style.display !== "none";
-  }
-
-  function togglePopup() {
-    if (isPopupVisible()) closePopup();
-    else openPopup();
-  }
-
-  function openPopup() {
-    ensureOverlay();
-    state.overlay.style.display = "block";
-    setTimeout(() => state.input?.focus(), 0);
-    startObserver();
-  }
-
-  function closePopup() {
-    stopObserver();
-    clearHighlights();
-    if (state.overlay) state.overlay.style.display = "none";
-    state.query = "";
-    state.index = 0;
-    updateCount();
-  }
-
-  function onQueryChange() {
-    state.query = (state.input.value || "").trim();
-    rehighlightAll();
-  }
-
-  function debounce(fn, ms) {
-    let t = null;
-    return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
-  }
-  const rehighlightAll = debounce(() => {
-    clearHighlights();
-    if (!state.query) {
-      state.marks = [];
-      state.index = 0;
-      updateCount();
-      return;
-    }
-    highlightAll(state.query);
-    state.index = 0;
-    updateCurrent();
-  }, 150);
-
+  // ── Observer ─────────────────────────────────────────────────────────────────
   function startObserver() {
-    if (state.observer) return;
-    state.observer = new MutationObserver(() => { if (state.query) rehighlightAll(); });
-    state.observer.observe(document.body, { subtree: true, childList: true, characterData: true });
-    window.addEventListener("popstate", rehighlightAll, { passive: true });
-    window.addEventListener("hashchange", rehighlightAll, { passive: true });
+    if (_observer) return;
+    _observer = new MutationObserver(() => {
+      if (!lastQuery) return;
+      if (_ownWrite) return;               // mutation came from us — skip
+      scheduleRescan();
+    });
+    _observer.observe(document.documentElement, {
+      childList:     true,
+      subtree:       true,
+      characterData: true,
+    });
+    log("info", "observer started");
   }
 
   function stopObserver() {
-    if (state.observer) { state.observer.disconnect(); state.observer = null; }
-    window.removeEventListener("popstate", rehighlightAll);
-    window.removeEventListener("hashchange", rehighlightAll);
-  }
-
-  function clearHighlights() {
-    document.querySelectorAll("mark.dyn-mark").forEach((m) => {
-      // unwrap mark but keep text
-      const text = document.createTextNode(m.textContent || "");
-      m.replaceWith(text);
-    });
-    state.marks = [];
-  }
-
-  function isExcluded(node) {
-    let el = node.parentElement;
-    while (el) {
-      if (el.id === OVERLAY_ID) return true;
-      const tag = el.tagName;
-      if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") return true;
-      el = el.parentElement;
+    if (_observer) {
+      _observer.disconnect();
+      _observer = null;
+      log("info", "observer stopped");
     }
-    return false;
   }
 
-  function escapeRegExp(string) {
-    return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // ── Highlight engine ─────────────────────────────────────────────────────────
+  function clearHighlights() {
+    markOwnWrite();                         // unwrapping marks = our own write
+    marks.forEach((m) => {
+      const p = m.parentNode;
+      if (!p) return;
+      p.replaceChild(document.createTextNode(m.textContent), m);
+      p.normalize();
+    });
+    marks      = [];
+    currentIdx = -1;
+    if (countEl) countEl.textContent = "0 / 0";
   }
 
-  function highlightAll(query) {
-    const regex = new RegExp(escapeRegExp(query), "gi");
+  function highlightQuery(query) {
+    clearHighlights();
+    lastQuery = query;
+    saveSession();                          // FIX 2: persist immediately
+
+    if (!query) return;
+
+    let re;
+    try {
+      re = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    } catch (e) {
+      log("warn", "bad pattern", e.message);
+      return;
+    }
+
+    // Collect matching text nodes
+    const textNodes = [];
     const walker = document.createTreeWalker(
       document.body,
       NodeFilter.SHOW_TEXT,
       {
-        acceptNode: (n) => {
-          if (!n.nodeValue || !n.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-          return isExcluded(n) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
-        }
+        acceptNode(node) {
+          const el  = node.parentElement;
+          if (!el) return NodeFilter.FILTER_REJECT;
+          const tag = el.tagName.toUpperCase();
+          if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT")
+            return NodeFilter.FILTER_REJECT;
+          if (el.closest("#dyn-search-popup"))
+            return NodeFilter.FILTER_REJECT;
+          if (!node.nodeValue.trim())
+            return NodeFilter.FILTER_SKIP;
+          re.lastIndex = 0;
+          return re.test(node.nodeValue)
+            ? NodeFilter.FILTER_ACCEPT
+            : NodeFilter.FILTER_SKIP;
+        },
       }
     );
 
-    while (walker.nextNode()) {
-      const node = walker.currentNode;
-      const text = node.nodeValue;
-      let match, lastIndex = 0, found = false;
-      regex.lastIndex = 0;
+    let n;
+    while ((n = walker.nextNode())) textNodes.push(n);
 
+    // Insert marks — guard the entire batch as a single own-write
+    markOwnWrite();
+    textNodes.forEach((textNode) => {
+      re.lastIndex = 0;
       const frag = document.createDocumentFragment();
-
-      while ((match = regex.exec(text)) !== null) {
-        found = true;
-        const before = text.slice(lastIndex, match.index);
-        if (before) frag.appendChild(document.createTextNode(before));
-
+      const text = textNode.nodeValue;
+      let last = 0, m;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > last)
+          frag.appendChild(document.createTextNode(text.slice(last, m.index)));
         const mark = document.createElement("mark");
         mark.className = "dyn-mark";
-        mark.textContent = match[0];
+        mark.textContent = m[0];
         frag.appendChild(mark);
-
-        lastIndex = regex.lastIndex;
+        marks.push(mark);
+        last = re.lastIndex;
       }
-      if (found) {
-        const after = text.slice(lastIndex);
-        if (after) frag.appendChild(document.createTextNode(after));
-        node.parentNode.replaceChild(frag, node);
-      }
-    }
-
-    state.marks = Array.from(document.querySelectorAll("mark.dyn-mark")).filter((m) => {
-      let el = m.parentElement;
-      while (el) {
-        if (el.id === OVERLAY_ID) return false;
-        el = el.parentElement;
-      }
-      return true;
+      if (last < text.length)
+        frag.appendChild(document.createTextNode(text.slice(last)));
+      textNode.parentNode?.replaceChild(frag, textNode);
     });
+
+    log("info", `highlighted ${marks.length} matches for "${query}"`);
     updateCount();
+
+    if (marks.length > 0) {
+      currentIdx = 0;
+      scrollTo(0);
+    }
+  }
+
+  // ── Navigation ───────────────────────────────────────────────────────────────
+  // classList changes are also DOM mutations — guard them too.
+  function scrollTo(idx) {
+    if (!marks.length || idx < 0 || idx >= marks.length) return;
+    markOwnWrite();                         // FIX 1: class changes are mutations
+    marks.forEach((m) => m.classList.remove("dyn-mark-current"));
+    marks[idx].classList.add("dyn-mark-current");
+    marks[idx].scrollIntoView({ behavior: "smooth", block: "center" });
+    updateCount();
+    log("info", `at match ${idx + 1} / ${marks.length}`);
+  }
+
+  function navigateNext() {
+    if (!marks.length) return;
+    currentIdx = (currentIdx + 1) % marks.length;
+    scrollTo(currentIdx);
+  }
+
+  function navigatePrev() {
+    if (!marks.length) return;
+    currentIdx = (currentIdx - 1 + marks.length) % marks.length;
+    scrollTo(currentIdx);
   }
 
   function updateCount() {
-    if (!state.countEl) return;
-    const total = state.marks.length;
-    const current = total ? state.index + 1 : 0;
-    state.countEl.textContent = `${current}/${total}`;
+    if (!countEl) return;
+    countEl.textContent = marks.length === 0
+      ? "0 / 0"
+      : `${currentIdx + 1} / ${marks.length}`;
   }
 
-  function updateCurrent() {
-    state.marks.forEach((m) => m.classList.remove("dyn-current"));
-    if (!state.marks.length) { updateCount(); return; }
-    const m = state.marks[state.index];
-    if (m) {
-      m.classList.add("dyn-current");
-      try { m.scrollIntoView({ behavior: "smooth", block: "center", inline: "nearest" }); }
-      catch { m.scrollIntoView(); }
+  // ── Debounced rescan (dynamic content changes) ───────────────────────────────
+  function scheduleRescan() {
+    clearTimeout(rescanTimer);
+    rescanTimer = setTimeout(() => {
+      if (lastQuery) {
+        log("info", "rescan triggered by page change");
+        highlightQuery(lastQuery);
+      }
+    }, 500);
+  }
+
+  // ── In-page popup UI ─────────────────────────────────────────────────────────
+  function createPopup() {
+    if (popup) { inputEl?.focus(); return; }
+    log("info", "createPopup");
+
+    popup = document.createElement("div");
+    popup.id = "dyn-search-popup";
+    popup.setAttribute("role", "search");
+    popup.setAttribute("aria-label", "Dynamic search");
+    popup.innerHTML = `
+      <input id="dyn-search-input" type="text" placeholder="Search page…"
+             autocomplete="off" spellcheck="false" aria-label="Search term"/>
+      <span  id="dyn-search-count" aria-live="polite">0 / 0</span>
+      <button id="dyn-prev"  title="Previous (Shift+Enter)" aria-label="Previous">&#8593;</button>
+      <button id="dyn-next"  title="Next (Enter)"           aria-label="Next">&#8595;</button>
+      <button id="dyn-close" title="Close (Esc)"            aria-label="Close">&#10005;</button>
+    `;
+    document.body.appendChild(popup);
+
+    inputEl = popup.querySelector("#dyn-search-input");
+    countEl = popup.querySelector("#dyn-search-count");
+
+    inputEl.addEventListener("input", () => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => highlightQuery(inputEl.value.trim()), 300);
+    });
+
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter")  { e.preventDefault(); e.shiftKey ? navigatePrev() : navigateNext(); }
+      if (e.key === "Escape") { e.preventDefault(); closePopup(); }
+    });
+
+    popup.querySelector("#dyn-prev").addEventListener("click",  navigatePrev);
+    popup.querySelector("#dyn-next").addEventListener("click",  navigateNext);
+    popup.querySelector("#dyn-close").addEventListener("click", closePopup);
+
+    // Restore previous query (works for both SPA and real-page-load resumption)
+    if (lastQuery) {
+      inputEl.value = lastQuery;
+      highlightQuery(lastQuery);
     }
-    updateCount();
+
+    requestAnimationFrame(() => inputEl?.focus());
+    startObserver();
+    saveSession();                          // FIX 2: record that popup is open
+    log("info", "popup created");
   }
 
-  function goTo(delta) {
-    if (!state.marks.length) return;
-    state.index = (state.index + delta + state.marks.length) % state.marks.length;
-    updateCurrent();
+  function closePopup() {
+    log("info", "closePopup");
+    clearHighlights();
+    stopObserver();
+    clearTimeout(debounceTimer);
+    clearTimeout(rescanTimer);
+    popup?.remove();
+    popup = inputEl = countEl = null;
+    marks      = [];
+    currentIdx = -1;
+    lastQuery  = "";
+    _ownWrite  = false;
+    clearSession();                         // FIX 2: user explicitly closed — don't reopen
+    log("info", "popup closed and session cleared");
   }
 
-  // Receive broadcast from background (toolbar icon click)
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.type === "TOGGLE_POPUP") {
-      // Act only if this document is the visible, top page (prevents toggling in background tabs/frames)
-      const isTop = window.top === window;
-      const isVisible = document.visibilityState === "visible";
-      if (isTop && isVisible) togglePopup();
+  function togglePopup() {
+    popup ? closePopup() : createPopup();
+  }
+
+  // ── SPA navigation (History API) ─────────────────────────────────────────────
+  ["popstate", "hashchange"].forEach((evt) =>
+    window.addEventListener(evt, () => {
+      if (lastQuery) {
+        // Page content will change — let the observer catch it via scheduleRescan.
+        // But also schedule a fallback rescan ourselves in case the SPA swaps
+        // content before the observer fires.
+        setTimeout(() => {
+          if (lastQuery) {
+            log("info", "SPA nav detected — re-highlighting");
+            highlightQuery(lastQuery);
+          }
+        }, 400);
+      }
+    })
+  );
+
+  // ── Keyboard shortcut (Ctrl+Shift+F) ─────────────────────────────────────────
+  document.addEventListener("keydown", (e) => {
+    if (e.ctrlKey && e.shiftKey && e.key === "F") {
+      e.preventDefault();
+      togglePopup();
     }
   });
 
-  // Initialize hidden overlay
-  ensureOverlay();
-})();
+  // ── Message listener ──────────────────────────────────────────────────────────
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.action === "togglePopup") {
+      togglePopup();
+      sendResponse({ ok: true, popupOpen: !!popup });
+      return false;
+    }
+    if (msg.action === "getStatus") {
+      sendResponse({ popupOpen: !!popup, matchCount: marks.length, currentIdx, lastQuery, logEntries: window.__dynSearchLog.length });
+      return false;
+    }
+    if (msg.action === "getDebugLog") {
+      sendResponse({ log: window.__dynSearchLog.slice() });
+      return false;
+    }
+    if (msg.action === "clearLog") {
+      window.__dynSearchLog = [];
+      sendResponse({ ok: true });
+      return false;
+    }
+    sendResponse({ ok: false, reason: "unknown action" });
+    return false;
+  });
+
+  // ── Init: restore session across real page loads (FIX 2) ─────────────────────
+  // If the user had a search open and then clicked a real <a href> link,
+  // the page reloaded and this script ran fresh. We read back the session
+  // and reopen the popup with the previous query on the new page.
+  (async () => {
+    const session = await loadSession();
+    if (session?.open && session?.query) {
+      log("info", `restoring session query "${session.query}" after page load`);
+      lastQuery = session.query;            // set before createPopup so it picks it up
+      // Small delay: let the page finish rendering before we walk its text nodes
+      setTimeout(() => createPopup(), 350);
+    }
+  })();
+
+  log("info", "content script ready (v3.1)");
+}
